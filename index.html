@@ -223,8 +223,203 @@
         <h2>3. El Proceso de Rasterización a Detalle</h2>
         <p>La rasterización es el paso donde tomamos todas estas elipses 2D proyectadas ($\mu_{2D}, \Sigma', c, \alpha$) y coloreamos los píxeles de la pantalla. Hacer esto ingenuamente gaussiana por gaussiana sería lentísimo. Por eso se usa una técnica paralelizable en la GPU.</p>
 
-        <h3>Paso 3.1: División en Cuadrículas (Tiling)</h3>
-        <p>La pantalla se divide en pequeños bloques o "Tiles" (por ejemplo, cuadrados de 16x16 píxeles). Cada Gaussiana en la pantalla crea un "Bounding Box" (caja delimitadora). Si la caja delimitadora de la Gaussiana toca un bloque (Tile), se añade a una lista de pertenencia a ese bloque. Esto permite que la tarjeta gráfica (GPU) solo procese las Gaussianas que realmente afectan un área.</p>
+        <h3>Paso 3.1: División en Cuadrículas (Tiling), Axis-Aligned Bounding Box (AABB) y el “Radio” de la Elipse</h3>
+        <p>La pantalla se divide en pequeños bloques o "Tiles" (por ejemplo, cuadrados de 16x16 píxeles). Cada Gaussiana proyectada en 2D está descrita por una elipse con centro $\mu_{2D}$ y covarianza $\Sigma' \in \mathbb{R}^{2\times 2}$. Para acelerar, el rasterizador necesita una forma rápida de responder: <strong>¿qué píxeles podría afectar este splat?</strong> Para eso calcula un <strong>radio en píxeles</strong> (en realidad, un tamaño máximo) y construye un <em>Axis-Aligned Bounding Box (AABB)</em> para el splat.</p>
+
+        <h4>¿Qué es un Axis-Aligned Bounding Box (AABB)?</h4>
+        <p>Un AABB es una caja rectangular alineada con los ejes de la pantalla (ejes X e Y) que contiene completamente la elipse proyectada. Es "axis-aligned" porque sus lados son paralelos a los ejes de la pantalla, a diferencia de una OBB (oriented bounding box) que rota con la elipse. El AABB es más simple de calcular y suficiente como primera aproximación para el tiling.</p>
+        <p>Matemáticamente, con un radio conservador $r$ (en píxeles) el AABB se define como:</p>
+        <div class="math-box">
+            $$ x_{min} = \mu_x - r, \quad x_{max} = \mu_x + r, \quad y_{min} = \mu_y - r, \quad y_{max} = \mu_y + r $$
+        </div>
+        <p>El AABB se convierte a indices de píxel (clamp al dominio de la imagen) y luego a indices de <em>tiles</em> para binning.</p>
+
+        <h4>¿Qué significa “radio” aquí?</h4>
+        <p>No es un radio circular único, porque la mancha es una elipse rotada. En práctica se usa un valor escalar que garantiza que el splat cae dentro de la caja cuadrada. Ese radio normalmente representa un corte de $k$-sigmas, es decir, el punto donde la gaussiana ya es tan pequeña que se considera despreciable.</p>
+
+        <p>La gaussiana 2D evaluada en un píxel depende de:</p>
+        <div class="math-box">
+            $$ G(\Delta p) = \exp\left(-\frac{1}{2} \Delta p^T \Sigma'^{-1} \Delta p \right) $$
+        </div>
+        <p>Los contornos de igual valor son elipses dadas por:</p>
+        <div class="math-box">
+            $$ \Delta p^T \Sigma'^{-1} \Delta p = c $$
+        </div>
+
+        <p>Si elegimos un umbral de corte $G(\Delta p) \ge \tau$ (por ejemplo $\tau=10^{-4}$), entonces:</p>
+        <div class="math-box">
+            $$ \exp\left(-\frac{1}{2} c\right) \ge \tau \;\Rightarrow\; c \le -2\ln(\tau) $$
+        </div>
+        <p>En muchas implementaciones se usa directamente un <strong>corte $k$-sigma</strong>: $c = k^2$ (por ejemplo $k=3$ o $k=4$). Esto es equivalente a un umbral fijo aproximado.</p>
+
+        <h4>Cómo se obtiene el tamaño máximo (radio) desde $\Sigma'$</h4>
+        <p>Sea $\Sigma'$ simétrica positiva definida. Sus <strong>autovalores</strong> $\lambda_1, \lambda_2$ representan las varianzas en los ejes principales de la elipse. Las desviaciones estándar son:</p>
+        <div class="math-box">
+            $$ \sigma_1 = \sqrt{\lambda_1}, \quad \sigma_2 = \sqrt{\lambda_2} $$
+        </div>
+        <p>El semi-eje mayor (en píxeles) para un corte $k$-sigma es:</p>
+        <div class="math-box">
+            $$ a = k\sigma_{max} = k\sqrt{\max(\lambda_1,\lambda_2)} $$
+        </div>
+        <p>Y muchas veces el rasterizador usa un radio conservador:</p>
+        <div class="math-box">
+            $$ r = \lceil a \rceil $$
+        </div>
+        <p>Con esto el AABB básico es:</p>
+        <div class="math-box">
+            $$ [x_{min}, x_{max}] = [\mu_x - r,\; \mu_x + r], \quad [y_{min}, y_{max}] = [\mu_y - r,\; \mu_y + r] $$
+        </div>
+
+        <h4>Detalle del Proceso de Tiling (Algoritmo práctico)</h4>
+        <p>A continuación se describe un flujo GPU-friendly que se usa en implementaciones reales (dos pasadas) para asignar splats a tiles y rasterizar:</p>
+        <ol>
+            <li><strong>Calcular AABB por splat:</strong> para cada splat (en paralelo) calcula $r$ y el AABB en coordenadas de píxel. Trunca a la resolución de la imagen.</li>
+            <li><strong>Convertir AABB a rango de tiles:</strong> usando el tamaño de tile (por ejemplo 16), calcula:
+                <div class="math-box">
+                    $$ t_x^{min} = \left\lfloor\frac{x_{min}}{tileSize}\right\rfloor, \quad t_x^{max} = \left\lfloor\frac{x_{max}}{tileSize}\right\rfloor $$
+                    $$ t_y^{min} = \left\lfloor\frac{y_{min}}{tileSize}\right\rfloor, \quad t_y^{max} = \left\lfloor\frac{y_{max}}{tileSize}\right\rfloor $$
+                </div>
+            </li>
+            <li><strong>Primer pase (conteo):</strong> cada splat incrementa contadores por tile que será afectado (uso de atomics o almacenamiento temporal). Esto calcula cuántos splats afectan cada tile.</li>
+            <li><strong>Exclusive prefix-sum (scan):</strong> se hace un prefix-sum sobre los contadores de tiles para reservar memoria continua para las listas (bin lists) — genera offsets para cada tile.</li>
+            <li><strong>Segundo pase (llenado):</strong> cada splat vuelve a iterar sus tiles y escribe su ID en la lista del tile en la posición determinada por el prefix-sum (usando contadores locales o atomics por tile).</li>
+            <li><strong>Rasterización por tile:</strong> cada tile se procesa en paralelo; cada hilo/pixel del tile recorre la lista de splats asociados y evalúa la gaussiana exacta, acumulando color, profundidad y normales. Las listas suelen ordenar splats por profundidad (front-to-back) para permitir early-stop cuando la transmitancia es casi cero.</li>
+        </ol>
+
+        <h4>Pseudocódigo (simplificado)</h4>
+        <pre><code>// Primer pase: contar
+for each splat s in parallel:
+  r = compute_radius(s)
+  [xmin,xmax,ymin,ymax] = compute_AABB(s,r)
+  for ty = tile_ymin to tile_ymax:
+    for tx = tile_xmin to tile_xmax:
+      atomicAdd(tileCount[ty,tx], 1)
+
+// Prefix-sum sobre tileCount -> tileOffset
+
+// Segundo pase: llenar
+for each splat s in parallel:
+  r = compute_radius(s)
+  [xmin,xmax,ymin,ymax] = compute_AABB(s,r)
+  for ty = tile_ymin to tile_ymax:
+    for tx = tile_xmin to tile_xmax:
+      index = atomicAdd(tileFillCounter[ty,tx], 1)
+      tileList[tileOffset[ty,tx] + index] = s_id
+
+// Rasterizar por tile (cada tile en paralelo)
+for each tile in parallel:
+  for each pixel p in tile in parallel:
+    T = 1.0
+    color = 0
+    for each s_id in tileList[tile]:
+      compute G = gaussian_at_pixel(s_id, p)
+      alpha = s_alpha * G
+      contrib = alpha * T
+      color += contrib * s_color
+      T *= (1 - alpha)
+      if T < eps: break
+    write color to framebuffer[p]
+</code></pre>
+
+        <h4>Detalles de Rendimiento y Implementación</h4>
+        <ul>
+            <li><strong>Two-pass binning</strong> (conteo + llenado) evita contenciones costosas que ocurren si todos los splats intentan escribir simultáneamente en listas dinámicas con atomics pesados.</li>
+            <li><strong>Order-by-depth</strong> dentro de cada tile acelera early-stop. Si la mayoría de la opacidad se encuentra en los primeros splats, la inner loop corta pronto.</li>
+            <li><strong>Local memory / shared memory:</strong> en CUDA/GLSL/Vulkan, mover la lista del tile a memoria compartida antes de procesar los píxeles reduce latencias.</li>
+            <li><strong>Balance de carga:</strong> algunos tiles pueden tener muchas gaussianas; las implementaciones hacen splitting dinámico o trabajo por bloque para balancear.
+            </li>
+        </ul>
+
+        <p><strong>Resumen:</strong> El AABB (axis-aligned) es la aproximación rápida que usamos para saber qué tiles puede afectar una elipse. El radio proviene del corte por umbral o k-sigma y relaciona directamente precisión y coste. El método de tiling con two-pass binning y rasterización por tile es la forma más eficiente y escalable para rasterizar millones de splats en GPU.</p>
+
+        <p><strong>¿Para qué sirve el radio en el código?</strong></p>
+
+        <h4>Ejemplo numérico paso a paso</h4>
+        <p>Vamos a seguir un splat concreto y calcular $r$, su AABB y cómo se asigna a tiles.</p>
+        <ol>
+            <li><strong>Datos del splat (ejemplo):</strong>
+                <ul>
+                    <li>Centro proyectado en píxeles: $\mu_{2D} = (300.5, 200.2)$</li>
+                    <li>Covarianza 2x2 proyectada (en píxeles²):
+                        <div class="math-box">
+                            $$ \Sigma' = \begin{bmatrix} 25 & 10 \\ 10 & 9 \end{bmatrix} $$
+                        </div>
+                    </li>
+                    <li>Tamaño de la imagen: 800 x 600 px</li>
+                    <li>Tamaño de tile: 16 x 16 px</li>
+                    <li>Elegimos corte: $k = 3$ (3-sigma)</li>
+                </ul>
+            </li>
+
+            <li><strong>Paso A: calcular autovalores de $\Sigma'$</strong>
+                <p>Resolvemos $\det(\Sigma' - \lambda I)=0$:</p>
+                <div class="math-box">
+                    $$ \det\begin{pmatrix}25-\lambda & 10 \\ 10 & 9-\lambda \end{pmatrix} = (25-\lambda)(9-\lambda) - 100 = 0 $$
+                </div>
+                <p>Expandimos:</p>
+                <div class="math-box">
+                    $$ \lambda^2 -34\lambda +125 = 0 $$
+                </div>
+                <p>Solucionando la cuadrática:</p>
+                <div class="math-box">
+                    $$ \lambda = \frac{34 \pm \sqrt{34^2 - 4\cdot125}}{2} = \frac{34 \pm \sqrt{1156 - 500}}{2} = \frac{34 \pm \sqrt{656}}{2} $$
+                </div>
+                <p>Calculando números:</p>
+                <div class="math-box">
+                    $$ \sqrt{656} \approx 25.61 $$
+                    $$ \lambda_1 \approx \frac{34 + 25.61}{2} \approx 29.805 $$
+                    $$ \lambda_2 \approx \frac{34 - 25.61}{2} \approx 4.195 $$
+                </div>
+            </li>
+
+            <li><strong>Paso B: desviaciones estándar</strong>
+                <div class="math-box">
+                    $$ \sigma_1 = \sqrt{29.805} \approx 5.46, \quad \sigma_2 = \sqrt{4.195} \approx 2.05 $$
+                </div>
+            </li>
+
+            <li><strong>Paso C: semieje mayor para k=3</strong>
+                <div class="math-box">
+                    $$ a = k \cdot \sigma_{max} = 3 \cdot 5.46 \approx 16.38 $$
+                </div>
+                <p>Radio conservador (redondeado hacia arriba):</p>
+                <div class="math-box">
+                    $$ r = \lceil 16.38 \rceil = 17 \;\text{píxeles} $$
+                </div>
+            </li>
+
+            <li><strong>Paso D: AABB en píxeles</strong>
+                <div class="math-box">
+                    $$ x_{min} = 300.5 - 17 = 283.5, \quad x_{max} = 300.5 + 17 = 317.5 $$
+                    $$ y_{min} = 200.2 - 17 = 183.2, \quad y_{max} = 200.2 + 17 = 217.2 $$
+                </div>
+                <p>Clamp a enteros y al tamaño de la imagen:</p>
+                <div class="math-box">
+                    $$ x_{min}^{int} = \max(0, \lfloor 283.5 \rfloor) = 283, \quad x_{max}^{int} = \min(799, \lceil317.5\rceil) = 318 $$
+                    $$ y_{min}^{int} = \max(0, \lfloor183.2\rfloor)=183, \quad y_{max}^{int} = \min(599, \lceil217.2\rceil)=218 $$
+                </div>
+            </li>
+
+            <li><strong>Paso E: Asignación a tiles</strong>
+                <p>Convertimos a indices de tiles dividiendo por 16:</p>
+                <div class="math-box">
+                    $$ t_x^{min} = \left\lfloor\frac{283}{16}\right\rfloor = 17, \quad t_x^{max} = \left\lfloor\frac{318}{16}\right\rfloor = 19 $$
+                    $$ t_y^{min} = \left\lfloor\frac{183}{16}\right\rfloor = 11, \quad t_y^{max} = \left\lfloor\frac{218}{16}\right\rfloor = 13 $$
+                </div>
+                <p>Por lo tanto, el splat afectará a los tiles con índices $t_x \in \{17,18,19\}$ y $t_y \in \{11,12,13\}$. En total 3x3 = 9 tiles.</p>
+            </li>
+
+            <li><strong>Paso F: Rasterización intratile (píxel a píxel)</strong>
+                <p>Dentro de cada tile, cada hilo/píxel evalúa la gaussiana exacta y calcula $\alpha'_i = \alpha_i G(\Delta p)$. Si usas early-stop por transmitancia, algunos píxeles dejarán de procesar más splats cuando $T$ sea pequeño.</p>
+            </li>
+        </ol>
+
+        <p>Este ejemplo muestra cómo a partir de una covarianza y una elección de $k$ (o umbral $\tau$) se obtiene un radio, se forma un AABB y se calcula la lista de tiles candidatos a procesar para ese splat.</p>
+        <ul>
+            <li><strong>Tiling / binning:</strong> asignar la gaussiana a tiles rápidamente.</li>
+            <li><strong>Culling temprano:</strong> si el bounding box no toca la pantalla, se descarta.</li>
+            <li><strong>Coste predecible:</strong> limitar cuántos píxeles “visita” un splat.</li>
+        </ul>
 
         <div class="svg-container">
             <svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
@@ -553,12 +748,48 @@
         <p><strong>1. Base para la Alineación de Normales (Normal-Depth Alignment)</strong></p>
         <p>Como mencionamos antes, la geometría debe ser coherente. La normal renderizada $\hat{\mathbf{N}}$ DEBE coincidir con la inclinación del mapa de profundidad $D(x,y)$. Si el mapa de profundidad cambia abruptamente, la normal debe reflejar ese cambio. El mapa de profundidad es la "verdad fundamental" (ground truth) que guía la orientación de los discos.</p>
         
-        <p><strong>2. Depth Distortion Loss (Pérdida de Distorsión de Profundidad)</strong></p>
-        <p>En el 3DGS clásico, un píxel puede renderizarse acumulando color de 50 gaussianas dispersas a diferentes profundidades (creando un volumen borroso). En 2DGS queremos superficies finas. Se aplica una penalización si la distancia de un splat individual $d_i$ está muy lejos de la profundidad esperada $D(x,y)$ del píxel.</p>
+        <p><strong>2. Depth Distortion Loss (Pérdida de Distorsión de Profundidad) — por píxel</strong></p>
+        <p>Esta pérdida existe para evitar que un mismo píxel mezcle opacidad desde muchas profundidades distintas (la típica apariencia de “volumen/niebla” en 3DGS). La idea: <strong>si un píxel recibe contribución fuerte desde dos profundidades muy separadas, penalízalo</strong>. En 2DGS esto ayuda a colapsar el grosor hacia una superficie delgada.</p>
+
+        <h4>Primero: define el peso real de cada splat en el píxel</h4>
+        <p>Para un píxel fijo $(x,y)$, recorres los splats ordenados de cerca a lejos. Define:</p>
+        <ul>
+            <li>Opacidad efectiva en el píxel: $\alpha'_i = \alpha_i \cdot G_i(x,y)$</li>
+            <li>Transmitancia antes del splat $i$: $T_i = \prod_{j=1}^{i-1} (1-\alpha'_j)$</li>
+            <li><strong>Peso de contribución</strong>: $\omega_i = T_i\,\alpha'_i$</li>
+        </ul>
+        <p>Interpretación: $\omega_i$ es la “cantidad de rayo” que <strong>realmente</strong> se asigna al splat $i$ en ese píxel. Observa que:</p>
         <div class="math-box">
-            $$ \mathcal{L}_{distortion} = \sum_{i,j} \omega_i \omega_j |d_i - d_j| $$
+            $$ \sum_i \omega_i = 1 - T_{N+1} \le 1 $$
         </div>
-        <p>Donde $\omega_i = \alpha'_i \prod_{k=1}^{i-1} (1 - \alpha'_k)$ es el peso (contribución) del splat $i$. Esta fórmula penaliza fuertemente si dos splats (i, j) tienen un peso alto pero profundidades ($d_i, d_j$) muy diferentes. Obliga a que toda la opacidad se concentre en un solo punto del eje Z.</p>
+
+        <h4>Definición clásica (pairwise) de distorsión por píxel</h4>
+        <p>La versión conceptual más común (la que tú viste) es:</p>
+        <div class="math-box">
+            $$ \mathcal{L}_{dist}(x,y) = \sum_{i}\sum_{j} \omega_i\,\omega_j\,|d_i - d_j| $$
+        </div>
+        <p>Donde $d_i$ es la profundidad del splat $i$ (normalmente $z$ en espacio cámara o una profundidad monotónica equivalente). Si hay dos contribuciones grandes en profundidades distintas, el término $|d_i-d_j|$ crece y sube la pérdida.</p>
+
+        <h4>Forma equivalente e intuitiva: “varianza” alrededor de la profundidad esperada</h4>
+        <p>Muchas implementaciones lo conectan con la idea de concentración alrededor de una sola profundidad. Si defines la profundidad esperada (que ya calculas en el forward):</p>
+        <div class="math-box">
+            $$ D(x,y) = \sum_i \omega_i d_i $$
+        </div>
+        <p>Entonces una forma muy cercana (y más barata) es penalizar dispersión:</p>
+        <div class="math-box">
+            $$ \widetilde{\mathcal{L}}_{dist}(x,y) = \sum_i \omega_i\,|d_i - D(x,y)| $$
+        </div>
+        <p>No es idéntica a la doble suma para todos los casos, pero la intención geométrica es la misma: forzar que todos los $d_i$ con peso alto estén cerca de un único valor.</p>
+
+        <h4>Cómo se acumula en el entrenamiento</h4>
+        <p>La pérdida total suma sobre todos los píxeles (o un subconjunto):</p>
+        <div class="math-box">
+            $$ \mathcal{L}_{distortion} = \sum_{x,y} \mathcal{L}_{dist}(x,y) $$
+        </div>
+
+        <h4>¿Forward o Backward?</h4>
+        <p><strong>Forward:</strong> necesitas computar $\alpha'_i$, $T_i$, $\omega_i$ y $d_i$ mientras rasterizas (lo mismo que haces para color/profundidad).<br>
+        <strong>Backward:</strong> los gradientes fluyen hacia los parámetros de cada splat (posición $\mu$, covarianza/escala $\Sigma$, opacidad $\alpha$, e incluso orientación en 2DGS), porque cambiar esos parámetros cambia $G_i(x,y)$, cambia $\omega_i$, y por tanto cambia la pérdida. En práctica, si estás implementando un rasterizador diferenciable, esta pérdida se computa como parte del forward y su derivada se propaga en el backward.</p>
         
         <p><strong>3. Extracción de Mallas (Mesh Extraction)</strong></p>
         <p>El objetivo final de 2DGS <strong>no es solo renderizado bonito</strong>, sino poder extraer un modelo 3D sólido y exportable (una malla poligonal) que pueda usarse en motores 3D tradicionales, imprimirse en 3D, o editarse. Este es el gran diferenciador de 2DGS frente al 3DGS clásico, que produce solo nubes de puntos.</p>
